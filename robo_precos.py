@@ -18,8 +18,17 @@ if arquivo_fat and arquivo_tab:
             df_fat = pd.read_csv(arquivo_fat)
             df_tab = pd.read_csv(arquivo_tab)
 
-            # --- NOVA FUNÇÃO DE LIMPEZA DE NÚMEROS ---
-            # Remove R$, espaços e ajusta vírgulas para que o Python entenda como matemática
+            # --- LIMPEZA DE TEXTO (Tira espaços invisíveis do início e fim das palavras) ---
+            # Faturamento
+            df_fat['recurso.variedade.c'] = df_fat['recurso.variedade.c'].astype(str).str.strip()
+            df_fat['cliente.classe.un'] = df_fat['cliente.classe.un'].astype(str).str.strip()
+            df_fat['recurso.modelocaixa'] = df_fat['recurso.modelocaixa'].astype(str).str.strip()
+            # Tabela
+            df_tab['VARIEDADE'] = df_tab['VARIEDADE'].astype(str).str.strip()
+            df_tab['TABELA'] = df_tab['TABELA'].astype(str).str.strip()
+            df_tab['CAIXA'] = df_tab['CAIXA'].astype(str).str.strip()
+
+            # --- LIMPEZA DE NÚMEROS ---
             def limpar_numero(val):
                 if pd.api.types.is_number(val):
                     return val
@@ -28,21 +37,19 @@ if arquivo_fat and arquivo_tab:
                     val = val.replace('.', '').replace(',', '.')
                 return pd.to_numeric(val, errors='coerce')
 
-            # Aplica a limpeza nas colunas de valor antes da divisão
             df_fat['totalfinanceiro'] = df_fat['totalfinanceiro'].apply(limpar_numero)
             df_fat['QTD caixa'] = df_fat['QTD caixa'].apply(limpar_numero)
-            
             if 'Preço Final CX' in df_tab.columns:
                 df_tab['Preço Final CX'] = df_tab['Preço Final CX'].apply(limpar_numero)
-            # ----------------------------------------
 
+            # --- TRATAMENTO DE DATAS ---
             df_fat['emissaomovdate'] = pd.to_datetime(df_fat['emissaomovdate'], format='%d/%m/%Y', errors='coerce')
             df_tab['vigencia_inicio'] = pd.to_datetime(df_tab['vigencia_inicio'], errors='coerce')
             df_tab['vigencia_fim'] = pd.to_datetime(df_tab['vigencia_fim'], errors='coerce')
 
-            # Agora a divisão vai funcionar perfeitamente
             df_fat['Preco_Faturado_CX'] = df_fat['totalfinanceiro'] / df_fat['QTD caixa']
 
+            # --- CRUZAMENTO (MERGE) ---
             df_cruzado = pd.merge(
                 df_fat, df_tab,
                 left_on=['recurso.variedade.c', 'cliente.classe.un', 'recurso.modelocaixa'],
@@ -50,13 +57,29 @@ if arquivo_fat and arquivo_tab:
                 how='left'
             )
 
-            df_valido = df_cruzado[
-                (df_cruzado['emissaomovdate'] >= df_cruzado['vigencia_inicio']) &
-                (df_cruzado['emissaomovdate'] <= df_cruzado['vigencia_fim'])
-            ]
+            # --- PAINEL DE DIAGNÓSTICO (Para você ver onde as linhas somem) ---
+            with st.expander("🛠️ Ver Diagnóstico do Robô (Clique para expandir)"):
+                st.write(f"**1.** Total de linhas no Faturamento original: `{len(df_fat)}`")
+                
+                sem_tabela = df_cruzado[df_cruzado['Preço Final CX'].isna()]
+                st.write(f"**2.** Linhas que o robô NÃO achou a tabela (Nomes não bateram): `{len(sem_tabela)}`")
+                if not sem_tabela.empty:
+                    st.warning("Verifique se estas Variedades, Classes ou Caixas existem na Tabela Oficial:")
+                    st.dataframe(sem_tabela[['recurso.variedade.c', 'cliente.classe.un', 'recurso.modelocaixa']].drop_duplicates())
 
+                df_valido = df_cruzado[
+                    (df_cruzado['emissaomovdate'] >= df_cruzado['vigencia_inicio']) &
+                    (df_cruzado['emissaomovdate'] <= df_cruzado['vigencia_fim'])
+                ]
+                st.write(f"**3.** Linhas que passaram no filtro de Data de Vigência: `{len(df_valido)}`")
+
+            # --- BUSCA DE DIVERGÊNCIAS ---
+            # Só compara se a linha conseguiu encontrar um preço válido e passou pela data
+            df_valido = df_valido.dropna(subset=['Preço Final CX', 'Preco_Faturado_CX'])
+            
             df_valido['Preco_Faturado_CX'] = df_valido['Preco_Faturado_CX'].round(2)
             df_valido['Preço Final CX'] = df_valido['Preço Final CX'].round(2)
+            
             divergencias = df_valido[df_valido['Preco_Faturado_CX'] != df_valido['Preço Final CX']]
 
             st.divider()
@@ -87,7 +110,7 @@ Por favor, verifiquem se houve alguma exceção ou desconto aprovado para estes 
 Atenciosamente,
 Auditoria de Preços"""
                 
-                st.text_area("📋 Modelo de E-mail gerado (Revise ou copie se necessário):", value=modelo_email, height=280)
+                st.text_area("📋 Modelo de E-mail gerado:", value=modelo_email, height=280)
                 
                 assunto = urllib.parse.quote("⚠️ Alerta: Divergência de Preços (Faturamento x Tabela)")
                 corpo = urllib.parse.quote(modelo_email)
@@ -101,7 +124,7 @@ Auditoria de Preços"""
                 with col_btn2:
                     st.link_button("📧 2. Abrir no E-mail (Outlook/Gmail)", link_mailto, use_container_width=True)
             else:
-                st.success("✅ Tudo certo! Nenhum faturamento divergiu da tabela de preços.")
+                st.success("✅ Tudo certo! Nenhum faturamento divergiu da tabela de preços (verifique o diagnóstico acima caso ache que faltou algo).")
 
         except Exception as e:
             st.error(f"Ocorreu um erro ao processar os arquivos. Detalhe técnico: {e}")
