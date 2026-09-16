@@ -22,50 +22,37 @@ import streamlit as st
 # CONFIGURAÇÃO DE NEGÓCIO
 # =============================================================================
 
+# De/Para oficial: tabela do faturamento -> tabela de preços.
+# A lista é uma ordem de preferência. Uma mesma tabela do faturamento aponta
+# para nomes diferentes conforme a linha de produto (melão usa "Merc Interno",
+# pimentão/uva usam "FOB" e "CIF SP"). O robô escolhe o primeiro nome que
+# realmente existe na tabela oficial para aquela variedade e marca, então não é
+# preciso manter uma lista de quais variedades são de qual família.
+DEPARA_OFICIAL = {
+    "CFI Mercado Interno FOB - Sem Frete": ["4. Merc Int Sem Frete", "1. NO/NE FOB", "0. FOB"],
+    "CFI Mercado Interno": ["1. Merc Interno", "2. SU/SE/CO CIF SP"],
+    "CFI Mercado Interno NO e RJ": ["2. Merc Int (NOR, RJ, MT, MS)", "1. NO/NE FOB"],
+    "CFI Mercado Interno SUL": ["3. Merc Int SUL", "2. SU/SE/CO CIF SP"],
+    "CFI Mercado Interno Desconto 7%": ["6. DescFinanc 7%"],
+    "CFI Mercado Interno Desconto 7% PR e RJ": ["7. DescFinanc 7% PR+RJ"],
+    "CFI Mercado Interno Desconto 5%": ["5. DescFinanc 5%"],
+    "CFI Mercado Interno GPA": ["9. GPA"],
+    "CFI Mercado Interno Especial": ["1.1 Merc Interno Esp"],
+}
+
+# Tabelas do faturamento que não são venda a cliente — não entram na auditoria.
+# Estabelecimentos ITR é filial de faturamento (transferência interna).
+TABELAS_FORA_ESCOPO_PADRAO = ["Estabelecimentos ITR"]
+
+# Só para agrupar o relatório por zona, não interfere no cruzamento
 REGIOES_UF = {
     "NE": ["CE", "BA", "PE", "PB", "RN", "AL", "SE", "MA", "PI"],
-    "NO": ["AM", "PA", "AP", "RR", "RO", "AC", "TO"],
+    "NORTE": ["AM", "PA", "AP", "RR", "RO", "AC", "TO"],
     "SUL": ["RS", "SC", "PR"],
-    "SE_CO": ["SP", "MG", "ES", "RJ", "GO", "DF", "MT", "MS"],
+    "SUDESTE": ["SP", "MG", "ES", "RJ"],
+    "CENTRO-OESTE": ["GO", "DF", "MT", "MS"],
 }
 UF_PARA_REGIAO = {uf: reg for reg, ufs in REGIOES_UF.items() for uf in ufs}
-
-# Famílias de produto: cada família usa uma nomenclatura diferente na coluna TABELA
-FAMILIA_PIMENTAO = ["BAM", "BVM", "BLR", "BMS"]
-
-# De/Para direto — independe da UF do cliente
-DEPARA_DIRETO = {
-    "CFI Mercado Interno Desconto 7%": "6. DescFinanc 7%",
-    "CFI Mercado Interno Desconto 7% PR e RJ": "7. DescFinanc 7% PR+RJ",
-    "CFI Mercado Interno Desconto 5%": "5. DescFinanc 5%",
-    "CFI Mercado Interno Especial": "1.1 Merc Interno Esp",
-    "CFI Mercado Interno GPA": "9. GPA",
-    "CFI Mercado Interno SUL": "3. Merc Int SUL",
-    "CFI Mercado Interno NO e RJ": "2. Merc Int (NOR, RJ, MT, MS)",
-}
-
-# Regra por região — usada quando o De/Para direto não se aplica
-# (venda FOB / Mercado Interno: o preço segue a região do cliente)
-REGRA_REGIAO_PADRAO = {
-    "MELAO": {
-        "NE": "4. Merc Int Sem Frete",
-        "NO": "2. Merc Int (NOR, RJ, MT, MS)",
-        "SUL": "3. Merc Int SUL",
-        "SE_CO": "1. Merc Interno",
-    },
-    "PIMENTAO": {
-        "NE": "1. NO/NE FOB",
-        "NO": "1. NO/NE FOB",
-        "SUL": "2. SU/SE/CO CIF SP",
-        "SE_CO": "2. SU/SE/CO CIF SP",
-    },
-}
-
-# RJ, MT e MS usam a tabela "NOR, RJ, MT, MS" mesmo estando no Sudeste/Centro-Oeste
-UF_EXCECAO_NOR = ["RJ", "MT", "MS"]
-
-# Tabelas do faturamento que não são venda a cliente — não entram na auditoria
-TABELAS_FORA_ESCOPO_PADRAO = ["Estabelecimentos ITR"]
 
 COLS_FAT = {
     "data": "emissaomovdate",
@@ -168,6 +155,17 @@ def normalizar(valor) -> str:
     return re.sub(r"\s+", " ", s).strip().upper()
 
 
+def chave_tabela(valor) -> str:
+    """Normaliza o nome da tabela do faturamento.
+
+    Absorve variações de digitação ('FI' por 'CFI'), pontuação e espaços,
+    para o De/Para não quebrar por causa de um caractere.
+    """
+    s = normalizar(valor)
+    s = re.sub(r"^C?FI\s+", "", s)            # 'CFI ' / 'FI ' viram prefixo opcional
+    return re.sub(r"[^A-Z0-9%]+", "", s)
+
+
 def extrair_codigos_variedade(codigo, rotulo) -> list:
     """'BAM/BAM/BLR' + '8. Pimentão BVM/BAM/BLR' -> ['BAM', 'BLR', 'BVM']"""
     achados = {p.strip().upper() for p in str(codigo).split("/") if p.strip()}
@@ -198,7 +196,9 @@ def preparar_faturamento(bruto: bytes) -> pd.DataFrame:
     out = pd.DataFrame(index=df.index)
     out["data"] = para_data(df[c["data"]])
     out["tabela_fat"] = df[c["tabela"]].astype(str).str.strip()
+    out["tabela_key"] = out["tabela_fat"].map(chave_tabela)
     out["uf"] = df[c["uf"]].astype(str).str.strip().str.upper()
+    out["regiao"] = out["uf"].map(UF_PARA_REGIAO).fillna("NÃO CLASSIFICADA")
     out["grupo"] = df[c["grupo"]].astype(str).str.strip()
     out["cliente"] = df[c["cliente"]].astype(str).str.strip()
     out["produto"] = df[c["produto"]].astype(str).str.strip()
@@ -233,7 +233,7 @@ def preparar_tabela(bruto: bytes) -> pd.DataFrame:
     out["tipo_min"] = df[c["tipomin"]].map(para_numero)
     out["tipo_max"] = df[c["tipomax"]].map(para_numero)
 
-    # uma variedade composta vira várias linhas, uma por código
+    # uma variedade composta (BVM/BAM/BLR) vira várias linhas, uma por código
     out["variedade"] = out.apply(
         lambda r: extrair_codigos_variedade(r["variedade_raw"], r["variedade_label"]),
         axis=1,
@@ -246,32 +246,39 @@ def preparar_tabela(bruto: bytes) -> pd.DataFrame:
 # =============================================================================
 
 
-def montar_regra(fat: pd.DataFrame, depara: dict, regra_regiao: dict,
-                 familia_pimentao: list, fora_escopo: list) -> pd.DataFrame:
-    """Define, para cada linha faturada, qual linha da tabela oficial é a correta."""
+def aplicar_depara(fat: pd.DataFrame, tab: pd.DataFrame, depara: dict,
+                   fora_escopo: list) -> pd.DataFrame:
+    """Define, para cada linha faturada, qual linha da tabela oficial é a correta.
+
+    Quando o De/Para oferece mais de um destino (caso de FOB, que se chama
+    "4. Merc Int Sem Frete" no melão e "1. NO/NE FOB" no pimentão), vence o
+    primeiro destino que existe na tabela oficial para aquela variedade e marca.
+    """
     fat = fat.copy()
-    fat["familia"] = np.where(fat["variedade"].isin(familia_pimentao), "PIMENTAO", "MELAO")
-    fat["regiao"] = fat["uf"].map(UF_PARA_REGIAO)
-    fat.loc[fat["uf"].isin(UF_EXCECAO_NOR), "regiao"] = "NO"
+    depara_key = {chave_tabela(k): list(v) for k, v in depara.items()}
+    fora_key = {chave_tabela(x) for x in fora_escopo}
 
-    depara_key = {normalizar(k): v for k, v in depara.items()}
-    fora_key = {normalizar(x) for x in fora_escopo}
+    # quais tabelas existem para cada variedade + marca
+    disponiveis = (
+        tab.dropna(subset=["preco_tab"])
+        .groupby(["variedade", "marca_key"])["tabela_of"].agg(set).to_dict()
+    )
 
-    def alvo(r):
-        chave = normalizar(r["tabela_fat"])
-        if chave in fora_key:
+    def resolver(r):
+        if r["tabela_key"] in fora_key:
             return None, "Fora de escopo (não é venda a cliente)"
-        if chave in depara_key:
-            destino = depara_key[chave]
-            # a família Pimentão não tem as tabelas regionais de melão
-            if r["familia"] == "PIMENTAO" and destino.startswith(("2. Merc", "3. Merc")):
-                destino = regra_regiao["PIMENTAO"].get(r["regiao"])
-            return destino, "De/Para direto"
-        if pd.isna(r["regiao"]):
-            return None, f"UF '{r['uf']}' não classificada em nenhuma região"
-        return regra_regiao[r["familia"]].get(r["regiao"]), "Regra por região"
+        candidatos = depara_key.get(r["tabela_key"])
+        if not candidatos:
+            return None, f"Tabela '{r['tabela_fat']}' sem De/Para configurado"
+        existentes = disponiveis.get((r["variedade"], r["marca_key"]), set())
+        for destino in candidatos:
+            if destino in existentes:
+                return destino, "De/Para oficial"
+        # nenhum candidato existe para este produto: usa o primeiro para que a
+        # linha apareça como "sem preço na tabela" em vez de sumir do relatório
+        return candidatos[0], "De/Para oficial (produto sem preço cadastrado)"
 
-    res = fat.apply(alvo, axis=1, result_type="expand")
+    res = fat.apply(resolver, axis=1, result_type="expand")
     fat["tabela_alvo"] = res[0]
     fat["origem_regra"] = res[1]
     return fat
@@ -283,14 +290,16 @@ def auditar(fat: pd.DataFrame, tab: pd.DataFrame,
     auditavel = fat[fat["tabela_alvo"].notna()].copy()
     auditavel["_id"] = np.arange(len(auditavel))
 
-    chaves_e = ["variedade", "marca_key", "tabela_alvo", "peso"]
-    chaves_d = ["variedade", "marca_key", "tabela_of", "peso"]
     m = auditavel.merge(
-        tab, left_on=chaves_e, right_on=chaves_d, how="left", suffixes=("", "_tab")
+        tab,
+        left_on=["variedade", "marca_key", "tabela_alvo", "peso"],
+        right_on=["variedade", "marca_key", "tabela_of", "peso"],
+        how="left", suffixes=("", "_tab"),
     )
 
     tem_candidato = m["preco_tab"].notna()
     na_vigencia = (m["data"] >= m["vig_ini"]) & (m["data"] <= m["vig_fim"])
+    # linhas sem faixa de tipo (pimentão: 'Vários', '250g') cruzam só por peso
     sem_faixa = m["tipo_min"].isna() | m["tipo_max"].isna()
     na_faixa = sem_faixa | ((m["tipo"] >= m["tipo_min"]) & (m["tipo"] <= m["tipo_max"]))
     valido = tem_candidato & na_vigencia & na_faixa
@@ -328,23 +337,35 @@ def identificar_origem_do_preco(res: pd.DataFrame, tab: pd.DataFrame,
                                 tol_reais: float) -> pd.Series:
     """Para cada linha, diz a qual coluna da tabela o preço FATURADO corresponde.
 
-    Distingue 'aplicaram a tabela errada' (bate com outra coluna) de
-    'preço fora de qualquer tabela' (não bate com nenhuma) — o primeiro caso
-    costuma ser erro de cadastro/rota, o segundo é desconto comercial.
+    Separa 'aplicaram a tabela errada' (o preço bate com outra coluna vigente)
+    de 'preço fora de tabela' (não bate com nenhuma) — o primeiro é erro de
+    rota/cadastro, o segundo é desconto comercial a justificar.
     """
     cand = res.reset_index(drop=True).assign(_lin=lambda d: d.index).merge(
-        tab, left_on=["variedade", "marca_key", "peso"],
-        right_on=["variedade", "marca_key", "peso"], how="left", suffixes=("", "_c"),
+        tab, on=["variedade", "marca_key", "peso"], how="left", suffixes=("", "_c"),
     )
     cand = cand[(cand["data"] >= cand["vig_ini_c"]) & (cand["data"] <= cand["vig_fim_c"])]
     sem_faixa = cand["tipo_min_c"].isna() | cand["tipo_max_c"].isna()
     cand = cand[sem_faixa | ((cand["tipo"] >= cand["tipo_min_c"])
                              & (cand["tipo"] <= cand["tipo_max_c"]))]
     bate = cand[(cand["preco_fat"] - cand["preco_tab_c"]).abs() <= tol_reais]
-    achado = bate.groupby("_lin")["tabela_of_c"].apply(
-        lambda s: " / ".join(sorted(set(s)))
-    )
-    return achado.reindex(range(len(res))).fillna("— nenhuma tabela vigente —")
+    achado = bate.groupby("_lin")["tabela_of_c"].apply(lambda s: " / ".join(sorted(set(s))))
+    return achado.reindex(range(len(res))).fillna("")
+
+
+def classificar_motivo(res: pd.DataFrame) -> pd.Series:
+    """Traduz o cruzamento em uma causa provável, para direcionar a cobrança."""
+    def motivo(r):
+        if r["status"] == "NÃO AUDITADO":
+            return r["origem_regra"]
+        if r["status"] == "SEM PREÇO NA TABELA":
+            return "Combinação não cadastrada na tabela vigente"
+        if r["status"] == "OK":
+            return "Conforme"
+        if r["confere_com"]:
+            return f"Tabela aplicada divergente — o preço é o de {r['confere_com']}"
+        return "Preço fora de qualquer tabela vigente (desconto comercial?)"
+    return res.apply(motivo, axis=1)
 
 
 # =============================================================================
@@ -352,20 +373,20 @@ def identificar_origem_do_preco(res: pd.DataFrame, tab: pd.DataFrame,
 # =============================================================================
 
 COLS_SAIDA = [
-    "data", "cliente", "grupo", "uf", "produto", "variedade", "marca",
+    "data", "cliente", "grupo", "uf", "regiao", "produto", "variedade", "marca",
     "tipo_txt", "peso", "qtd", "tabela_fat", "tabela_alvo", "tipo_label",
     "preco_fat", "preco_tab", "diferenca", "dif_pct", "impacto_rs", "status",
-    "confere_com",
+    "motivo", "linha_csv",
 ]
 ROTULOS = {
     "data": "Emissão", "cliente": "Cliente", "grupo": "Grupo", "uf": "UF",
-    "produto": "Produto", "variedade": "Variedade", "marca": "Marca",
-    "tipo_txt": "Tipo", "peso": "Peso Cx", "qtd": "Qtd Cx",
+    "regiao": "Região", "produto": "Produto", "variedade": "Variedade",
+    "marca": "Marca", "tipo_txt": "Tipo", "peso": "Peso Cx", "qtd": "Qtd Cx",
     "tabela_fat": "Tabela (faturamento)", "tabela_alvo": "Tabela oficial aplicada",
     "tipo_label": "Faixa da tabela", "preco_fat": "Preço faturado",
     "preco_tab": "Preço tabela", "diferenca": "Diferença R$",
     "dif_pct": "Diferença %", "impacto_rs": "Impacto R$", "status": "Status",
-    "confere_com": "Preço faturado confere com",
+    "motivo": "Causa provável", "linha_csv": "Linha do CSV",
 }
 
 
@@ -376,18 +397,16 @@ def formatar(df: pd.DataFrame) -> pd.DataFrame:
     return out.rename(columns=ROTULOS)
 
 
-def gerar_excel(divergencias, sem_preco, nao_auditado, resumo_cliente,
-                resumo_motivo, completo) -> bytes:
+def brl(valor) -> str:
+    """Formata no padrão pt-BR: 1.234.567,89"""
+    if valor is None or pd.isna(valor):
+        return "0,00"
+    return f"{valor:,.2f}".replace(",", "\x00").replace(".", ",").replace("\x00", ".")
+
+
+def gerar_excel(abas: list) -> bytes:
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="xlsxwriter") as xl:
-        abas = [
-            ("Divergências", formatar(divergencias)),
-            ("Sem preço na tabela", formatar(sem_preco)),
-            ("Não auditado", formatar(nao_auditado)),
-            ("Resumo por cliente", resumo_cliente),
-            ("Resumo por motivo", resumo_motivo),
-            ("Base completa", formatar(completo)),
-        ]
         livro = xl.book
         cab = livro.add_format({"bold": True, "bg_color": "#1F4E79", "font_color": "white",
                                 "border": 1, "align": "center", "valign": "vcenter"})
@@ -395,8 +414,9 @@ def gerar_excel(divergencias, sem_preco, nao_auditado, resumo_cliente,
         for nome, dados in abas:
             if dados is None or dados.empty:
                 dados = pd.DataFrame({"Sem registros": []})
-            dados.to_excel(xl, sheet_name=nome[:31], index=False, startrow=1, header=False)
-            ws = xl.sheets[nome[:31]]
+            aba = nome[:31]
+            dados.to_excel(xl, sheet_name=aba, index=False, startrow=1, header=False)
+            ws = xl.sheets[aba]
             for i, col in enumerate(dados.columns):
                 ws.write(0, i, str(col), cab)
                 maior = dados[col].astype(str).str.len().max()
@@ -410,34 +430,30 @@ def gerar_excel(divergencias, sem_preco, nao_auditado, resumo_cliente,
     return buf.getvalue()
 
 
-def brl(valor) -> str:
-    """Formata no padrão pt-BR: 1.234.567,89"""
-    if valor is None or pd.isna(valor):
-        return "0,00"
-    return f"{valor:,.2f}".replace(",", "\x00").replace(".", ",").replace("\x00", ".")
-
-
 def gerar_email(divergencias: pd.DataFrame, periodo: str, destinatarios: str) -> str:
     n = len(divergencias)
-    impacto = divergencias["impacto_rs"].sum(skipna=True)
+    if n == 0:
+        return "Nenhuma divergência encontrada no período."
+
     a_menor = divergencias[divergencias["status"] == "FATURADO A MENOR"]
     a_maior = divergencias[divergencias["status"] == "FATURADO A MAIOR"]
+    tabela_errada = divergencias[divergencias["confere_com"] != ""]
+    fora_tabela = divergencias[divergencias["confere_com"] == ""]
 
-    linhas = []
     top = divergencias.reindex(
         divergencias["impacto_rs"].abs().sort_values(ascending=False).index
     ).head(10)
-    for _, r in top.iterrows():
-        linhas.append(
-            f"• {r['cliente']} ({r['uf']}) | {r['variedade']} {r['marca']} "
-            f"Tipo {r['tipo_txt']} cx {r['peso']:g}kg | "
-            f"Faturado R$ {brl(r['preco_fat'])} x Tabela R$ {brl(r['preco_tab'])} "
-            f"({r['tabela_alvo']}) | Dif. R$ {brl(r['diferenca'])} "
-            f"| Impacto R$ {brl(r['impacto_rs'])}"
-        )
-    corpo_itens = "\n".join(linhas)
+    linhas = [
+        f"• {r['cliente']} ({r['uf']}) | {r['variedade']} {r['marca']} "
+        f"Tipo {r['tipo_txt']} cx {r['peso']:g}kg | "
+        f"Faturado R$ {brl(r['preco_fat'])} x Tabela R$ {brl(r['preco_tab'])} "
+        f"({r['tabela_alvo']}) | Dif. R$ {brl(r['diferenca'])} "
+        f"| Impacto R$ {brl(r['impacto_rs'])}"
+        for _, r in top.iterrows()
+    ]
+    corpo = "\n".join(linhas)
     if n > len(top):
-        corpo_itens += f"\n\n... e mais {n - len(top)} lançamento(s). O detalhamento está em anexo."
+        corpo += f"\n\n... e mais {n - len(top)} lançamento(s). O detalhamento está em anexo."
 
     return f"""Prezados,
 
@@ -445,12 +461,16 @@ Pedimos a sua verificação para os preços com as diferenças apresentadas no q
 
 Período auditado: {periodo}
 Lançamentos com divergência: {n}
-Faturados a MENOR que a tabela: {len(a_menor)} (impacto R$ {brl(a_menor['impacto_rs'].sum(skipna=True))})
-Faturados a MAIOR que a tabela: {len(a_maior)} (impacto R$ {brl(a_maior['impacto_rs'].sum(skipna=True))})
-Impacto líquido: R$ {brl(impacto)}
+  • Faturados a MENOR que a tabela: {len(a_menor)} (impacto R$ {brl(a_menor['impacto_rs'].sum(skipna=True))})
+  • Faturados a MAIOR que a tabela: {len(a_maior)} (impacto R$ {brl(a_maior['impacto_rs'].sum(skipna=True))})
+  • Impacto líquido: R$ {brl(divergencias['impacto_rs'].sum(skipna=True))}
+
+Por causa provável:
+  • {len(tabela_errada)} lançamento(s) com preço de OUTRA tabela vigente (possível rota/cadastro incorreto)
+  • {len(fora_tabela)} lançamento(s) com preço fora de qualquer tabela vigente (possível desconto comercial)
 
 Principais itens (por impacto):
-{corpo_itens}
+{corpo}
 
 Favor informar se há desconto ou condição comercial aprovada para estes casos.
 
@@ -475,18 +495,16 @@ with st.sidebar:
     tol_pct = st.number_input("Tolerância em %", 0.0, 20.0, 0.0, 0.1)
     st.divider()
     fora_escopo = st.multiselect(
-        "Tabelas fora do escopo",
-        options=TABELAS_FORA_ESCOPO_PADRAO + ["Clientes Diversos"],
+        "Tabelas fora do escopo", options=TABELAS_FORA_ESCOPO_PADRAO + ["Clientes Diversos"],
         default=TABELAS_FORA_ESCOPO_PADRAO,
         help="Estabelecimentos ITR é filial de faturamento — transferência interna, não venda.",
     )
-    familia_pimentao = st.multiselect(
-        "Variedades da família Pimentão", options=FAMILIA_PIMENTAO, default=FAMILIA_PIMENTAO,
-        help="Esta família usa a nomenclatura FOB / CIF SP na tabela oficial.",
-    )
     st.divider()
-    destinatarios = st.text_input("Destinatários do e-mail",
-                                  "com.inteligencia.de.mercado@itaueira.com; dir.comercial@itaueira.com")
+    config_json = st.file_uploader("Restaurar De/Para salvo (JSON)", type=["json"])
+    destinatarios = st.text_input(
+        "Destinatários do e-mail",
+        "com.inteligencia.de.mercado@itaueira.com; dir.comercial@itaueira.com",
+    )
 
 col1, col2 = st.columns(2)
 with col1:
@@ -506,56 +524,61 @@ except Exception as erro:  # noqa: BLE001
     st.stop()
 
 # --- De/Para editável -------------------------------------------------------
-with st.expander("🔗 Regra de precificação (De/Para) — clique para ajustar", expanded=False):
+depara_inicial = DEPARA_OFICIAL
+if config_json is not None:
+    try:
+        depara_inicial = json.loads(config_json.getvalue().decode("utf-8"))["depara"]
+        st.sidebar.success("De/Para restaurado do arquivo.")
+    except Exception as erro:  # noqa: BLE001
+        st.sidebar.error(f"JSON inválido: {erro}")
+
+with st.expander("🔗 De/Para oficial — clique para conferir ou ajustar", expanded=False):
     st.markdown(
-        "**Como o robô escolhe a linha da tabela:** primeiro procura no De/Para direto; "
-        "se não achar, aplica a regra por região da UF do cliente."
+        "Uma mesma tabela do faturamento pode ter nomes diferentes na tabela de preços "
+        "conforme a linha de produto (melão usa *Merc Interno*, pimentão e uva usam *FOB* "
+        "e *CIF SP*). Use a **ordem** para dizer a preferência: o robô aplica o primeiro "
+        "destino que existe na tabela oficial para aquela variedade e marca."
     )
     opcoes_tabela = sorted(tab["tabela_of"].dropna().unique().tolist())
-    tabelas_fat = sorted(fat["tabela_fat"].dropna().unique().tolist())
+    base = pd.DataFrame(
+        [{"Tabela no faturamento": k, "Ordem": i + 1, "Tabela de preço": v}
+         for k, destinos in depara_inicial.items() for i, v in enumerate(destinos)]
+    )
+    editado = st.data_editor(
+        base, hide_index=True, use_container_width=True, num_rows="dynamic", key="ed_depara",
+        column_config={
+            "Tabela no faturamento": st.column_config.TextColumn(required=True),
+            "Ordem": st.column_config.NumberColumn(min_value=1, step=1, required=True),
+            "Tabela de preço": st.column_config.SelectboxColumn(
+                options=opcoes_tabela, required=True),
+        },
+    )
+    depara = {
+        chave: grupo.sort_values("Ordem")["Tabela de preço"].tolist()
+        for chave, grupo in editado.dropna(subset=["Tabela no faturamento"])
+        .groupby("Tabela no faturamento")
+    }
 
-    base_depara = pd.DataFrame(
-        {"Tabela no faturamento": tabelas_fat,
-         "Tabela oficial": [DEPARA_DIRETO.get(t, "— usar regra por região —") for t in tabelas_fat]}
+    faltando = sorted(
+        set(fat["tabela_fat"]) - {k for k in depara} - set(fora_escopo)
+        - {t for t in fat["tabela_fat"] if chave_tabela(t) in {chave_tabela(k) for k in depara}}
     )
-    ed_depara = st.data_editor(
-        base_depara, hide_index=True, use_container_width=True, key="ed_depara",
-        column_config={"Tabela no faturamento": st.column_config.TextColumn(disabled=True),
-                       "Tabela oficial": st.column_config.SelectboxColumn(
-                           options=["— usar regra por região —"] + opcoes_tabela, required=True)},
-    )
-    depara = {r["Tabela no faturamento"]: r["Tabela oficial"] for _, r in ed_depara.iterrows()
-              if r["Tabela oficial"] != "— usar regra por região —"}
-
-    st.markdown("**Regra por região** (aplicada quando o De/Para acima está em *regra por região*)")
-    base_regiao = pd.DataFrame(
-        [{"Família": fam, "Região": reg, "Tabela oficial": destino}
-         for fam, mapa in REGRA_REGIAO_PADRAO.items() for reg, destino in mapa.items()]
-    )
-    ed_regiao = st.data_editor(
-        base_regiao, hide_index=True, use_container_width=True, key="ed_regiao",
-        column_config={"Família": st.column_config.TextColumn(disabled=True),
-                       "Região": st.column_config.TextColumn(disabled=True),
-                       "Tabela oficial": st.column_config.SelectboxColumn(
-                           options=opcoes_tabela, required=True)},
-    )
-    regra_regiao = {"MELAO": {}, "PIMENTAO": {}}
-    for _, r in ed_regiao.iterrows():
-        regra_regiao[r["Família"]][r["Região"]] = r["Tabela oficial"]
+    if faltando:
+        st.warning("Sem De/Para (vão para *Não auditado*): " + ", ".join(faltando))
 
     st.download_button(
-        "💾 Salvar esta configuração (JSON)",
-        json.dumps({"depara": depara, "regra_regiao": regra_regiao,
-                    "fora_escopo": fora_escopo, "familia_pimentao": familia_pimentao},
+        "💾 Salvar este De/Para (JSON)",
+        json.dumps({"depara": depara, "fora_escopo": fora_escopo},
                    ensure_ascii=False, indent=2).encode("utf-8"),
         file_name="config_auditoria_precos.json", mime="application/json",
     )
 
 # --- Execução ---------------------------------------------------------------
 with st.spinner("Cruzando faturamento x tabela oficial..."):
-    fat_regra = montar_regra(fat, depara, regra_regiao, familia_pimentao, fora_escopo)
+    fat_regra = aplicar_depara(fat, tab, depara, fora_escopo)
     res = auditar(fat_regra, tab, tol_reais, tol_pct).reset_index(drop=True)
     res["confere_com"] = identificar_origem_do_preco(res, tab, max(tol_reais, 0.01))
+    res["motivo"] = classificar_motivo(res)
 
 divergencias = res[res["status"].isin(["FATURADO A MAIOR", "FATURADO A MENOR"])].copy()
 sem_preco = res[res["status"] == "SEM PREÇO NA TABELA"].copy()
@@ -563,7 +586,7 @@ nao_auditado = res[res["status"] == "NÃO AUDITADO"].copy()
 conferidas = res[res["status"] != "NÃO AUDITADO"]
 
 datas = fat["data"].dropna()
-periodo = (f"{datas.min():%d/%m/%Y} a {datas.max():%d/%m/%Y}" if len(datas) else "n/d")
+periodo = f"{datas.min():%d/%m/%Y} a {datas.max():%d/%m/%Y}" if len(datas) else "n/d"
 
 st.divider()
 st.subheader(f"Resultado — período {periodo}")
@@ -575,10 +598,9 @@ k[3].metric("⚠️ Divergentes", f"{len(divergencias):,}".replace(",", "."),
             delta=f"{len(divergencias) / max(len(conferidas), 1) * 100:.1f}% do conferido",
             delta_color="inverse")
 k[4].metric("❓ Sem preço na tabela", f"{len(sem_preco):,}".replace(",", "."))
-k[5].metric("💰 Impacto líquido",
-            f"R$ {brl(divergencias['impacto_rs'].sum(skipna=True))}")
+k[5].metric("💰 Impacto líquido", f"R$ {brl(divergencias['impacto_rs'].sum(skipna=True))}")
 
-if len(divergencias) == 0 and len(sem_preco) == 0:
+if divergencias.empty and sem_preco.empty:
     st.success("✅ Nenhuma divergência encontrada no período.")
 
 aba1, aba2, aba3, aba4, aba5 = st.tabs(
@@ -589,65 +611,65 @@ with aba1:
     if divergencias.empty:
         st.success("Nenhuma divergência acima da tolerância.")
     else:
-        filtro = st.multiselect("Filtrar status", ["FATURADO A MENOR", "FATURADO A MAIOR"],
-                                default=["FATURADO A MENOR", "FATURADO A MAIOR"])
-        vis = divergencias[divergencias["status"].isin(filtro)]
+        c1, c2 = st.columns([1, 2])
+        f_status = c1.multiselect("Status", ["FATURADO A MENOR", "FATURADO A MAIOR"],
+                                  default=["FATURADO A MENOR", "FATURADO A MAIOR"])
+        causas = sorted(divergencias["motivo"].unique())
+        f_causa = c2.multiselect("Causa provável", causas, default=causas)
+        vis = divergencias[divergencias["status"].isin(f_status)
+                           & divergencias["motivo"].isin(f_causa)]
         vis = vis.reindex(vis["impacto_rs"].abs().sort_values(ascending=False).index)
+        st.caption(f"{len(vis)} lançamento(s) · impacto R$ {brl(vis['impacto_rs'].sum())}")
         st.dataframe(formatar(vis), use_container_width=True, hide_index=True, height=430)
 
-resumo_cliente = pd.DataFrame()
-resumo_motivo = pd.DataFrame()
+resumo_cliente = resumo_causa = resumo_regiao = pd.DataFrame()
 with aba2:
     if divergencias.empty:
         st.info("Sem divergências para resumir.")
     else:
-        resumo_cliente = (
-            divergencias.groupby(["cliente", "uf"], as_index=False)
-            .agg(Lançamentos=("status", "size"), Caixas=("qtd", "sum"),
-                 Impacto_RS=("impacto_rs", "sum"))
-            .sort_values("Impacto_RS", key=abs, ascending=False)
-            .rename(columns={"cliente": "Cliente", "uf": "UF", "Impacto_RS": "Impacto R$"})
-        )
-        resumo_motivo = (
-            divergencias.groupby(["tabela_fat", "tabela_alvo", "status"], as_index=False)
-            .agg(Lançamentos=("status", "size"), Impacto_RS=("impacto_rs", "sum"))
-            .sort_values("Impacto_RS", key=abs, ascending=False)
-            .rename(columns={"tabela_fat": "Tabela (faturamento)",
-                             "tabela_alvo": "Tabela oficial aplicada",
-                             "status": "Status", "Impacto_RS": "Impacto R$"})
-        )
+        def resumir(chaves, nomes):
+            return (divergencias.groupby(chaves, as_index=False)
+                    .agg(Lançamentos=("status", "size"), Caixas=("qtd", "sum"),
+                         Impacto_RS=("impacto_rs", "sum"))
+                    .sort_values("Impacto_RS", key=abs, ascending=False)
+                    .rename(columns={**nomes, "Impacto_RS": "Impacto R$"}))
+
+        resumo_cliente = resumir(["cliente", "uf"], {"cliente": "Cliente", "uf": "UF"})
+        resumo_causa = resumir(["motivo", "status"], {"motivo": "Causa provável",
+                                                      "status": "Status"})
+        resumo_regiao = resumir(["regiao"], {"regiao": "Região"})
+
         e1, e2 = st.columns(2)
         with e1:
             st.markdown("**Por cliente**")
-            st.dataframe(resumo_cliente, use_container_width=True, hide_index=True, height=320)
+            st.dataframe(resumo_cliente, use_container_width=True, hide_index=True, height=300)
+            st.markdown("**Por região**")
+            st.dataframe(resumo_regiao, use_container_width=True, hide_index=True)
         with e2:
-            st.markdown("**Por tabela aplicada**")
-            st.dataframe(resumo_motivo, use_container_width=True, hide_index=True, height=320)
-        st.markdown("**Por variedade e marca**")
-        st.dataframe(
-            divergencias.groupby(["variedade", "marca"], as_index=False)
-            .agg(Lançamentos=("status", "size"), Impacto_RS=("impacto_rs", "sum"))
-            .sort_values("Impacto_RS", key=abs, ascending=False)
-            .rename(columns={"variedade": "Variedade", "marca": "Marca",
-                             "Impacto_RS": "Impacto R$"}),
-            use_container_width=True, hide_index=True,
-        )
+            st.markdown("**Por causa provável**")
+            st.dataframe(resumo_causa, use_container_width=True, hide_index=True, height=300)
+            st.markdown("**Por variedade e marca**")
+            st.dataframe(resumir(["variedade", "marca"],
+                                 {"variedade": "Variedade", "marca": "Marca"}),
+                         use_container_width=True, hide_index=True)
 
 with aba3:
     st.caption("Combinações faturadas que não existem na tabela oficial vigente. "
-               "Não são divergência de preço — são lacuna de cadastro.")
+               "Não é divergência de preço — é lacuna de cadastro.")
     if sem_preco.empty:
         st.success("Todas as combinações faturadas têm preço na tabela.")
     else:
         st.dataframe(
             sem_preco.groupby(["variedade", "marca", "peso", "tipo_txt", "tabela_alvo"],
-                              as_index=False).agg(Lançamentos=("status", "size"),
-                                                  Caixas=("qtd", "sum")),
+                              as_index=False)
+            .agg(Lançamentos=("status", "size"), Caixas=("qtd", "sum"))
+            .rename(columns={"variedade": "Variedade", "marca": "Marca", "peso": "Peso Cx",
+                             "tipo_txt": "Tipo", "tabela_alvo": "Tabela procurada"}),
             use_container_width=True, hide_index=True,
         )
 
 with aba4:
-    st.caption("Linhas deliberadamente fora da auditoria.")
+    st.caption("Linhas deliberadamente fora da auditoria, ou sem De/Para configurado.")
     if nao_auditado.empty:
         st.info("Nenhuma linha fora do escopo.")
     else:
@@ -664,6 +686,14 @@ with aba5:
                  use_container_width=True, hide_index=True)
     d1, d2 = st.columns(2)
     with d1:
+        st.markdown("**De/Para efetivamente aplicado**")
+        st.dataframe(
+            res[res["tabela_alvo"].notna()]
+            .groupby(["tabela_fat", "tabela_alvo"], as_index=False).size()
+            .rename(columns={"tabela_fat": "Tabela (faturamento)",
+                             "tabela_alvo": "Tabela de preço", "size": "Linhas"}),
+            use_container_width=True, hide_index=True, height=300,
+        )
         st.markdown("**Vigências na tabela oficial**")
         st.dataframe(
             tab.groupby(["vig_ini", "vig_fim"], as_index=False).size()
@@ -676,33 +706,42 @@ with aba5:
             lambda d: ((tab["vig_ini"] <= d) & (tab["vig_fim"] >= d)).any())]
         if len(sem_vig):
             st.warning(f"{len(sem_vig)} linha(s) faturadas fora de qualquer vigência: "
-                       + ", ".join(sorted(sem_vig['data'].dt.strftime('%d/%m/%Y').unique())))
+                       + ", ".join(sorted(sem_vig["data"].dt.strftime("%d/%m/%Y").unique())))
     with d2:
         st.markdown("**Valores que não viraram número**")
-        problemas = pd.DataFrame({
-            "Campo": ["Preço faturado", "Peso caixa", "Qtd caixas", "Data emissão",
-                      "Preço tabela", "Vigência início"],
-            "Nulos": [fat["preco_fat"].isna().sum(), fat["peso"].isna().sum(),
-                      fat["qtd"].isna().sum(), fat["data"].isna().sum(),
-                      tab["preco_tab"].isna().sum(), tab["vig_ini"].isna().sum()],
-        })
-        st.dataframe(problemas, use_container_width=True, hide_index=True)
-        st.caption("Tipos não numéricos no faturamento (ex.: 'Vários', '250g') são "
-                   "cruzados por peso da caixa, pois a tabela não define faixa para eles.")
+        st.dataframe(
+            pd.DataFrame({
+                "Campo": ["Preço faturado", "Peso caixa", "Qtd caixas", "Data emissão",
+                          "Preço tabela", "Vigência início"],
+                "Nulos": [fat["preco_fat"].isna().sum(), fat["peso"].isna().sum(),
+                          fat["qtd"].isna().sum(), fat["data"].isna().sum(),
+                          tab["preco_tab"].isna().sum(), tab["vig_ini"].isna().sum()],
+            }), use_container_width=True, hide_index=True,
+        )
+        st.caption("Tipos não numéricos no faturamento ('Vários', '250g') são cruzados "
+                   "por peso da caixa, pois a tabela não define faixa de tipo para eles.")
 
 # --- Entregáveis ------------------------------------------------------------
 st.divider()
 st.subheader("📤 Entregáveis")
 
-texto_email = gerar_email(divergencias, periodo, destinatarios) if not divergencias.empty \
-    else "Nenhuma divergência encontrada no período."
-st.text_area("✉️ E-mail pronto para envio", texto_email, height=300)
+texto_email = gerar_email(divergencias, periodo, destinatarios)
+st.text_area("✉️ E-mail pronto para envio", texto_email, height=320)
 
 b1, b2 = st.columns(2)
 with b1:
     st.download_button(
         "📊 Baixar Excel completo",
-        gerar_excel(divergencias, sem_preco, nao_auditado, resumo_cliente, resumo_motivo, res),
+        gerar_excel([
+            ("Divergências", formatar(divergencias.reindex(
+                divergencias["impacto_rs"].abs().sort_values(ascending=False).index))),
+            ("Resumo por cliente", resumo_cliente),
+            ("Resumo por causa", resumo_causa),
+            ("Resumo por região", resumo_regiao),
+            ("Sem preço na tabela", formatar(sem_preco)),
+            ("Não auditado", formatar(nao_auditado)),
+            ("Base completa", formatar(res)),
+        ]),
         file_name=f"auditoria_precos_{date.today():%Y%m%d}.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         use_container_width=True, type="primary",
