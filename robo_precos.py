@@ -8,10 +8,12 @@ Execução:
     streamlit run auditoria_precos.py
 """
 
+import importlib
 import io
 import json
 import re
 import unicodedata
+import zipfile
 from datetime import date
 
 import numpy as np
@@ -56,6 +58,7 @@ UF_PARA_REGIAO = {uf: reg for reg, ufs in REGIOES_UF.items() for uf in ufs}
 
 COLS_FAT = {
     "data": "emissaomovdate",
+    "filial": "origemdestino.c",
     "tabela": "Tabela",
     "uf": "cliente.uf.c",
     "grupo": "cliente.grupo.c",
@@ -166,6 +169,13 @@ def chave_tabela(valor) -> str:
     return re.sub(r"[^A-Z0-9%]+", "", s)
 
 
+def nome_filial(valor) -> str:
+    """'ITR CBR Itaueira Agropecuária Canto do Buriti' -> 'CBR — Canto do Buriti'"""
+    s = str(valor).strip()
+    m = re.match(r"^ITR\s+([A-Z]{2,4})\s+Itaueira\s+Agropecu[áa]ria\s+(.+)$", s, re.I)
+    return f"{m.group(1).upper()} — {m.group(2).strip()}" if m else (s or "Não informada")
+
+
 def extrair_codigos_variedade(codigo, rotulo) -> list:
     """'BAM/BAM/BLR' + '8. Pimentão BVM/BAM/BLR' -> ['BAM', 'BLR', 'BVM']"""
     achados = {p.strip().upper() for p in str(codigo).split("/") if p.strip()}
@@ -195,6 +205,7 @@ def preparar_faturamento(bruto: bytes) -> pd.DataFrame:
     c = COLS_FAT
     out = pd.DataFrame(index=df.index)
     out["data"] = para_data(df[c["data"]])
+    out["filial"] = df[c["filial"]].astype(str).str.strip().map(nome_filial)
     out["tabela_fat"] = df[c["tabela"]].astype(str).str.strip()
     out["tabela_key"] = out["tabela_fat"].map(chave_tabela)
     out["uf"] = df[c["uf"]].astype(str).str.strip().str.upper()
@@ -373,13 +384,13 @@ def classificar_motivo(res: pd.DataFrame) -> pd.Series:
 # =============================================================================
 
 COLS_SAIDA = [
-    "data", "cliente", "grupo", "uf", "regiao", "produto", "variedade", "marca",
+    "data", "filial", "cliente", "grupo", "uf", "regiao", "produto", "variedade", "marca",
     "tipo_txt", "peso", "qtd", "tabela_fat", "tabela_alvo", "tipo_label",
     "preco_fat", "preco_tab", "diferenca", "dif_pct", "impacto_rs", "status",
     "motivo", "linha_csv",
 ]
 ROTULOS = {
-    "data": "Emissão", "cliente": "Cliente", "grupo": "Grupo", "uf": "UF",
+    "data": "Emissão", "filial": "Filial de faturamento", "cliente": "Cliente", "grupo": "Grupo", "uf": "UF",
     "regiao": "Região", "produto": "Produto", "variedade": "Variedade",
     "marca": "Marca", "tipo_txt": "Tipo", "peso": "Peso Cx", "qtd": "Qtd Cx",
     "tabela_fat": "Tabela (faturamento)", "tabela_alvo": "Tabela oficial aplicada",
@@ -404,80 +415,300 @@ def brl(valor) -> str:
     return f"{valor:,.2f}".replace(",", "\x00").replace(".", ",").replace("\x00", ".")
 
 
+def motor_excel():
+    """Devolve o primeiro motor de Excel disponível. Streamlit Cloud costuma ter
+    apenas openpyxl; o app não pode quebrar por causa disso."""
+    for nome in ("xlsxwriter", "openpyxl"):
+        try:
+            importlib.import_module(nome)
+            return nome
+        except ImportError:
+            continue
+    return None
+
+
 def gerar_excel(abas: list) -> bytes:
+    motor = motor_excel()
+    if motor is None:
+        raise ModuleNotFoundError(
+            "Nenhum motor de Excel instalado. Adicione 'xlsxwriter' ou 'openpyxl' "
+            "ao requirements.txt do app."
+        )
     buf = io.BytesIO()
-    with pd.ExcelWriter(buf, engine="xlsxwriter") as xl:
-        livro = xl.book
-        cab = livro.add_format({"bold": True, "bg_color": "#1F4E79", "font_color": "white",
-                                "border": 1, "align": "center", "valign": "vcenter"})
-        moeda = livro.add_format({"num_format": "#,##0.00"})
+    with pd.ExcelWriter(buf, engine=motor) as xl:
         for nome, dados in abas:
             if dados is None or dados.empty:
                 dados = pd.DataFrame({"Sem registros": []})
-            aba = nome[:31]
-            dados.to_excel(xl, sheet_name=aba, index=False, startrow=1, header=False)
-            ws = xl.sheets[aba]
-            for i, col in enumerate(dados.columns):
-                ws.write(0, i, str(col), cab)
-                maior = dados[col].astype(str).str.len().max()
-                maior = 10 if pd.isna(maior) else int(maior)
-                largura = min(max(len(str(col)) + 2, maior + 2), 45)
-                fmt = moeda if dados[col].dtype.kind in "fc" else None
-                ws.set_column(i, i, largura, fmt)
-            ws.freeze_panes(1, 0)
-            if len(dados):
-                ws.autofilter(0, 0, len(dados), len(dados.columns) - 1)
+            aba = re.sub(r"[\[\]:*?/\\]", "-", str(nome))[:31]
+            larguras = [
+                min(max(len(str(c)) + 2,
+                        (10 if pd.isna(dados[c].astype(str).str.len().max())
+                         else int(dados[c].astype(str).str.len().max())) + 2), 45)
+                for c in dados.columns
+            ]
+            if motor == "xlsxwriter":
+                dados.to_excel(xl, sheet_name=aba, index=False, startrow=1, header=False)
+                livro, ws = xl.book, xl.sheets[aba]
+                cab = livro.add_format({"bold": True, "bg_color": "#1F4E79",
+                                        "font_color": "white", "border": 1,
+                                        "align": "center", "valign": "vcenter"})
+                moeda = livro.add_format({"num_format": "#,##0.00"})
+                for i, col in enumerate(dados.columns):
+                    ws.write(0, i, str(col), cab)
+                    ws.set_column(i, i, larguras[i],
+                                  moeda if dados[col].dtype.kind in "fc" else None)
+                ws.freeze_panes(1, 0)
+                if len(dados):
+                    ws.autofilter(0, 0, len(dados), len(dados.columns) - 1)
+            else:
+                from openpyxl.styles import Alignment, Font, PatternFill
+                from openpyxl.utils import get_column_letter
+                dados.to_excel(xl, sheet_name=aba, index=False)
+                ws = xl.sheets[aba]
+                preenche = PatternFill("solid", fgColor="1F4E79")
+                for i, col in enumerate(dados.columns, start=1):
+                    celula = ws.cell(row=1, column=i)
+                    celula.font = Font(bold=True, color="FFFFFF")
+                    celula.fill = preenche
+                    celula.alignment = Alignment(horizontal="center", vertical="center")
+                    ws.column_dimensions[get_column_letter(i)].width = larguras[i - 1]
+                    if dados[col].dtype.kind in "fc":
+                        for linha in range(2, len(dados) + 2):
+                            ws.cell(row=linha, column=i).number_format = "#,##0.00"
+                ws.freeze_panes = "A2"
+                if len(dados):
+                    ws.auto_filter.ref = (
+                        f"A1:{get_column_letter(len(dados.columns))}{len(dados) + 1}")
     return buf.getvalue()
 
 
-def gerar_email(divergencias: pd.DataFrame, periodo: str, destinatarios: str) -> str:
-    n = len(divergencias)
-    if n == 0:
+def gerar_csvs_zip(abas: list) -> bytes:
+    """Plano B quando nenhum motor de Excel está disponível."""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        for nome, dados in abas:
+            if dados is None or dados.empty:
+                continue
+            arquivo = re.sub(r"[^\w\- ]+", "", str(nome)).strip().replace(" ", "_")
+            z.writestr(f"{arquivo}.csv",
+                       dados.to_csv(index=False, sep=";", decimal=",").encode("utf-8-sig"))
+    return buf.getvalue()
+
+
+# --- E-mail -----------------------------------------------------------------
+
+def _tabela_texto(df: pd.DataFrame, alinhar_dir: list) -> str:
+    """Tabela em largura fixa, legível em e-mail de texto puro."""
+    if df.empty:
+        return "  (sem registros)"
+    larg = {c: max(len(str(c)), *(len(str(v)) for v in df[c])) for c in df.columns}
+    def linha(vals):
+        return "  " + "  ".join(
+            str(v).rjust(larg[c]) if c in alinhar_dir else str(v).ljust(larg[c])
+            for c, v in zip(df.columns, vals))
+    sep = "  " + "  ".join("-" * larg[c] for c in df.columns)
+    return "\n".join([linha(df.columns), sep] + [linha(r) for r in df.itertuples(index=False)])
+
+
+def resumo_por_cliente(div: pd.DataFrame, limite: int) -> pd.DataFrame:
+    g = (div.groupby(["cliente", "uf"], as_index=False)
+         .agg(lanc=("status", "size"), caixas=("qtd", "sum"), impacto=("impacto_rs", "sum")))
+    g = g.reindex(g["impacto"].abs().sort_values(ascending=False).index)
+    corpo = g.head(limite)
+    saida = pd.DataFrame({
+        "Cliente": corpo["cliente"], "UF": corpo["uf"],
+        "Lanç.": corpo["lanc"].astype(int),
+        "Caixas": corpo["caixas"].map(lambda v: brl(v).replace(",00", "")),
+        "Impacto R$": corpo["impacto"].map(brl),
+    })
+    if len(g) > limite:
+        resto = g.tail(len(g) - limite)
+        saida.loc[len(saida)] = [f"+ outros {len(resto)} cliente(s)", "",
+                                 int(resto["lanc"].sum()),
+                                 brl(resto["caixas"].sum()).replace(",00", ""),
+                                 brl(resto["impacto"].sum())]
+    saida.loc[len(saida)] = ["TOTAL", "", int(g["lanc"].sum()),
+                             brl(g["caixas"].sum()).replace(",00", ""),
+                             brl(g["impacto"].sum())]
+    return saida
+
+
+def blocos_data_filial(div: pd.DataFrame, itens_por_bloco: int) -> list:
+    """Divergências agrupadas por data de emissão e filial de faturamento."""
+    blocos = []
+    for (dia, filial), g in div.groupby([div["data"].dt.date, "filial"], sort=True):
+        g = g.reindex(g["impacto_rs"].abs().sort_values(ascending=False).index)
+        itens = [
+            {"Cliente": f"{r['cliente']} ({r['uf']})",
+             "Produto": (f"{r['variedade']} {r['marca']} "
+                         f"{'T' + r['tipo_txt'] if str(r['tipo_txt']).isdigit() else r['tipo_txt']}"
+                         f" cx{r['peso']:g}kg"),
+             "Faturado": brl(r["preco_fat"]), "Tabela": brl(r["preco_tab"]),
+             "Dif.": brl(r["diferenca"]), "Qtd": brl(r["qtd"]).replace(",00", ""),
+             "Impacto R$": brl(r["impacto_rs"]), "Tabela aplicada": r["tabela_alvo"]}
+            for _, r in g.head(itens_por_bloco).iterrows()
+        ]
+        blocos.append({
+            "data": dia.strftime("%d/%m/%Y"), "filial": filial,
+            "lanc": len(g), "impacto": g["impacto_rs"].sum(),
+            "ocultos": max(len(g) - itens_por_bloco, 0),
+            "itens": pd.DataFrame(itens),
+        })
+    return sorted(blocos, key=lambda b: (b["data"], b["filial"]))
+
+
+def gerar_email(div: pd.DataFrame, periodo: str, destinatarios: str,
+                total_conferido: int, top_clientes: int = 12,
+                itens_por_bloco: int = 5) -> str:
+    if div.empty:
         return "Nenhuma divergência encontrada no período."
 
-    a_menor = divergencias[divergencias["status"] == "FATURADO A MENOR"]
-    a_maior = divergencias[divergencias["status"] == "FATURADO A MAIOR"]
-    tabela_errada = divergencias[divergencias["confere_com"] != ""]
-    fora_tabela = divergencias[divergencias["confere_com"] == ""]
+    menor = div[div["status"] == "FATURADO A MENOR"]
+    maior = div[div["status"] == "FATURADO A MAIOR"]
+    troca = div[div["confere_com"] != ""]
+    fora = div[div["confere_com"] == ""]
 
-    top = divergencias.reindex(
-        divergencias["impacto_rs"].abs().sort_values(ascending=False).index
-    ).head(10)
-    linhas = [
-        f"• {r['cliente']} ({r['uf']}) | {r['variedade']} {r['marca']} "
-        f"Tipo {r['tipo_txt']} cx {r['peso']:g}kg | "
-        f"Faturado R$ {brl(r['preco_fat'])} x Tabela R$ {brl(r['preco_tab'])} "
-        f"({r['tabela_alvo']}) | Dif. R$ {brl(r['diferenca'])} "
-        f"| Impacto R$ {brl(r['impacto_rs'])}"
-        for _, r in top.iterrows()
+    partes = [
+        "Prezados,",
+        "",
+        "Pedimos a sua verificação para os preços com as diferenças apresentadas nos "
+        "quadros abaixo. Solicitamos os seus comentários.",
+        "",
+        "=" * 78,
+        "RESUMO",
+        "=" * 78,
+        f"  Período auditado ................ {periodo}",
+        f"  Lançamentos conferidos .......... {total_conferido}",
+        f"  Lançamentos com divergência ..... {len(div)}",
+        f"  Faturados a MENOR que a tabela .. {len(menor)}  |  "
+        f"R$ {brl(menor['impacto_rs'].sum())}",
+        f"  Faturados a MAIOR que a tabela .. {len(maior)}  |  "
+        f"R$ {brl(maior['impacto_rs'].sum())}",
+        f"  IMPACTO LÍQUIDO ................. R$ {brl(div['impacto_rs'].sum())}",
+        "",
+        f"  Causa provável: {len(troca)} lançamento(s) com preço de OUTRA tabela vigente "
+        "(rota/cadastro)",
+        f"                  {len(fora)} lançamento(s) com preço fora de qualquer tabela "
+        "(desconto comercial?)",
+        "",
+        "=" * 78,
+        "1) IMPACTO POR CLIENTE",
+        "=" * 78,
+        _tabela_texto(resumo_por_cliente(div, top_clientes),
+                      ["Lanç.", "Caixas", "Impacto R$"]),
+        "",
+        "=" * 78,
+        "2) DISTORÇÕES POR DATA DE EMISSÃO E FILIAL DE FATURAMENTO",
+        "=" * 78,
     ]
-    corpo = "\n".join(linhas)
-    if n > len(top):
-        corpo += f"\n\n... e mais {n - len(top)} lançamento(s). O detalhamento está em anexo."
 
-    return f"""Prezados,
+    for b in blocos_data_filial(div, itens_por_bloco):
+        partes += [
+            "",
+            f"► {b['data']}  |  {b['filial']}",
+            f"  {b['lanc']} lançamento(s)  |  impacto R$ {brl(b['impacto'])}",
+            _tabela_texto(b["itens"], ["Faturado", "Tabela", "Dif.", "Qtd", "Impacto R$"]),
+        ]
+        if b["ocultos"]:
+            partes.append(f"  ... e mais {b['ocultos']} lançamento(s) desta data/filial "
+                          "no anexo.")
 
-Pedimos a sua verificação para os preços com as diferenças apresentadas no quadro abaixo. Solicitamos os seus comentários.
+    partes += [
+        "",
+        "=" * 78,
+        "",
+        "O detalhamento completo, linha a linha, está na planilha em anexo.",
+        "Favor informar se há desconto ou condição comercial aprovada para estes casos.",
+        "",
+        "Atenciosamente,",
+        "Auditoria de Preços",
+        "",
+        f"Para: {destinatarios}",
+    ]
+    return "\n".join(partes)
 
-Período auditado: {periodo}
-Lançamentos com divergência: {n}
-  • Faturados a MENOR que a tabela: {len(a_menor)} (impacto R$ {brl(a_menor['impacto_rs'].sum(skipna=True))})
-  • Faturados a MAIOR que a tabela: {len(a_maior)} (impacto R$ {brl(a_maior['impacto_rs'].sum(skipna=True))})
-  • Impacto líquido: R$ {brl(divergencias['impacto_rs'].sum(skipna=True))}
 
-Por causa provável:
-  • {len(tabela_errada)} lançamento(s) com preço de OUTRA tabela vigente (possível rota/cadastro incorreto)
-  • {len(fora_tabela)} lançamento(s) com preço fora de qualquer tabela vigente (possível desconto comercial)
+def gerar_email_html(div: pd.DataFrame, periodo: str, destinatarios: str,
+                     total_conferido: int, top_clientes: int = 12,
+                     itens_por_bloco: int = 5) -> str:
+    """Mesma estrutura, em HTML — cola no Gmail mantendo as tabelas."""
+    if div.empty:
+        return "<p>Nenhuma divergência encontrada no período.</p>"
 
-Principais itens (por impacto):
-{corpo}
+    menor = div[div["status"] == "FATURADO A MENOR"]
+    maior = div[div["status"] == "FATURADO A MAIOR"]
+    troca = div[div["confere_com"] != ""]
+    fora = div[div["confere_com"] == ""]
 
-Favor informar se há desconto ou condição comercial aprovada para estes casos.
+    est_tab = ("border-collapse:collapse;font:13px Arial,sans-serif;"
+               "margin:6px 0 16px 0;width:100%")
+    est_th = ("background:#1F4E79;color:#fff;padding:6px 9px;text-align:left;"
+              "border:1px solid #cfd8e3;white-space:nowrap")
+    est_td = "padding:5px 9px;border:1px solid #cfd8e3;vertical-align:top"
 
-Atenciosamente,
-Auditoria de Preços
-Para: {destinatarios}
-"""
+    def tabela(df, alinhar_dir, negrito_ultima=False):
+        if df.empty:
+            return "<p style='color:#666'>(sem registros)</p>"
+        cab = "".join(f"<th style='{est_th}'>{c}</th>" for c in df.columns)
+        linhas = []
+        for i, r in enumerate(df.itertuples(index=False)):
+            ult = negrito_ultima and i == len(df) - 1
+            fundo = "background:#eef3f9;font-weight:bold" if ult else (
+                "background:#fafbfd" if i % 2 else "")
+            tds = "".join(
+                f"<td style='{est_td};{fundo};"
+                f"{'text-align:right' if c in alinhar_dir else ''}'>{v}</td>"
+                for c, v in zip(df.columns, r))
+            linhas.append(f"<tr>{tds}</tr>")
+        return (f"<table style='{est_tab}'><thead><tr>{cab}</tr></thead>"
+                f"<tbody>{''.join(linhas)}</tbody></table>")
+
+    cor = "#c0392b" if div["impacto_rs"].sum() < 0 else "#1e8449"
+    html = [
+        "<div style=\"font:14px Arial,sans-serif;color:#1a1a1a;max-width:1000px\">",
+        "<p>Prezados,</p>",
+        "<p>Pedimos a sua verificação para os preços com as diferenças apresentadas "
+        "nos quadros abaixo. Solicitamos os seus comentários.</p>",
+        "<h3 style='margin:18px 0 4px;color:#1F4E79'>Resumo</h3>",
+        tabela(pd.DataFrame({
+            "Indicador": ["Período auditado", "Lançamentos conferidos",
+                          "Lançamentos com divergência", "Faturados a MENOR que a tabela",
+                          "Faturados a MAIOR que a tabela", "Impacto líquido"],
+            "Valor": [periodo, f"{total_conferido}", f"{len(div)}",
+                      f"{len(menor)} &nbsp;|&nbsp; R$ {brl(menor['impacto_rs'].sum())}",
+                      f"{len(maior)} &nbsp;|&nbsp; R$ {brl(maior['impacto_rs'].sum())}",
+                      f"<b style='color:{cor}'>R$ {brl(div['impacto_rs'].sum())}</b>"],
+        }), []),
+        f"<p style='font-size:13px;color:#444'><b>Causa provável:</b> {len(troca)} "
+        f"lançamento(s) com preço de <b>outra tabela vigente</b> (rota/cadastro) e "
+        f"{len(fora)} com preço <b>fora de qualquer tabela</b> (desconto comercial?).</p>",
+        "<h3 style='margin:22px 0 4px;color:#1F4E79'>1) Impacto por cliente</h3>",
+        tabela(resumo_por_cliente(div, top_clientes),
+               ["Lanç.", "Caixas", "Impacto R$"], negrito_ultima=True),
+        "<h3 style='margin:22px 0 4px;color:#1F4E79'>2) Distorções por data de emissão "
+        "e filial de faturamento</h3>",
+    ]
+    for b in blocos_data_filial(div, itens_por_bloco):
+        html.append(
+            f"<div style='margin-top:14px;padding:6px 10px;background:#eef3f9;"
+            f"border-left:4px solid #1F4E79;font-size:13px'>"
+            f"<b>{b['data']}</b> &nbsp;·&nbsp; {b['filial']} &nbsp;·&nbsp; "
+            f"{b['lanc']} lançamento(s) &nbsp;·&nbsp; impacto "
+            f"<b>R$ {brl(b['impacto'])}</b></div>")
+        html.append(tabela(b["itens"], ["Faturado", "Tabela", "Dif.", "Qtd", "Impacto R$"]))
+        if b["ocultos"]:
+            html.append(f"<p style='font-size:12px;color:#666;margin-top:-10px'>"
+                        f"... e mais {b['ocultos']} lançamento(s) desta data/filial "
+                        f"no anexo.</p>")
+    html += [
+        "<p style='margin-top:20px'>O detalhamento completo, linha a linha, está na "
+        "planilha em anexo.<br>Favor informar se há desconto ou condição comercial "
+        "aprovada para estes casos.</p>",
+        "<p>Atenciosamente,<br><b>Auditoria de Preços</b></p>",
+        f"<p style='font-size:12px;color:#666'>Para: {destinatarios}</p>",
+        "</div>",
+    ]
+    return "".join(html)
 
 
 # =============================================================================
@@ -623,6 +854,7 @@ with aba1:
         st.dataframe(formatar(vis), use_container_width=True, hide_index=True, height=430)
 
 resumo_cliente = resumo_causa = resumo_regiao = pd.DataFrame()
+resumo_filial = resumo_data = pd.DataFrame()
 with aba2:
     if divergencias.empty:
         st.info("Sem divergências para resumir.")
@@ -638,16 +870,28 @@ with aba2:
         resumo_causa = resumir(["motivo", "status"], {"motivo": "Causa provável",
                                                       "status": "Status"})
         resumo_regiao = resumir(["regiao"], {"regiao": "Região"})
+        resumo_filial = resumir(["filial"], {"filial": "Filial de faturamento"})
+        resumo_data = (divergencias.assign(Emissão=divergencias["data"].dt.strftime("%d/%m/%Y"))
+                       .groupby(["Emissão", "filial"], as_index=False)
+                       .agg(Lançamentos=("status", "size"), Caixas=("qtd", "sum"),
+                            Impacto_RS=("impacto_rs", "sum"))
+                       .rename(columns={"filial": "Filial de faturamento",
+                                        "Impacto_RS": "Impacto R$"})
+                       .sort_values(["Emissão", "Filial de faturamento"]))
 
         e1, e2 = st.columns(2)
         with e1:
-            st.markdown("**Por cliente**")
+            st.markdown("**Impacto por cliente**")
             st.dataframe(resumo_cliente, use_container_width=True, hide_index=True, height=300)
+            st.markdown("**Por filial de faturamento**")
+            st.dataframe(resumo_filial, use_container_width=True, hide_index=True)
             st.markdown("**Por região**")
             st.dataframe(resumo_regiao, use_container_width=True, hide_index=True)
         with e2:
+            st.markdown("**Por data de emissão e filial**")
+            st.dataframe(resumo_data, use_container_width=True, hide_index=True, height=300)
             st.markdown("**Por causa provável**")
-            st.dataframe(resumo_causa, use_container_width=True, hide_index=True, height=300)
+            st.dataframe(resumo_causa, use_container_width=True, hide_index=True)
             st.markdown("**Por variedade e marca**")
             st.dataframe(resumir(["variedade", "marca"],
                                  {"variedade": "Variedade", "marca": "Marca"}),
@@ -725,28 +969,60 @@ with aba5:
 st.divider()
 st.subheader("📤 Entregáveis")
 
-texto_email = gerar_email(divergencias, periodo, destinatarios)
-st.text_area("✉️ E-mail pronto para envio", texto_email, height=320)
+c1, c2 = st.columns(2)
+top_clientes = c1.slider("Clientes no quadro de impacto", 5, 40, 12,
+                         help="Os demais entram agregados como '+ outros N clientes'.")
+itens_bloco = c2.slider("Itens detalhados por data/filial", 1, 20, 5,
+                        help="O restante fica na planilha em anexo.")
 
-b1, b2 = st.columns(2)
+texto_email = gerar_email(divergencias, periodo, destinatarios, len(conferidas),
+                          top_clientes, itens_bloco)
+html_email = gerar_email_html(divergencias, periodo, destinatarios, len(conferidas),
+                              top_clientes, itens_bloco)
+
+e_html, e_txt = st.tabs(["✉️ E-mail formatado (copiar e colar no Gmail)", "📝 Texto puro"])
+with e_html:
+    st.caption("Selecione tudo abaixo, copie (Ctrl+C) e cole no Gmail — as tabelas "
+               "vão junto.")
+    st.markdown(html_email, unsafe_allow_html=True)
+with e_txt:
+    st.text_area("Versão em texto", texto_email, height=420, label_visibility="collapsed")
+
+abas_saida = [
+    ("Divergências", formatar(divergencias.reindex(
+        divergencias["impacto_rs"].abs().sort_values(ascending=False).index))),
+    ("Impacto por cliente", resumo_cliente),
+    ("Por data e filial", resumo_data),
+    ("Por filial", resumo_filial),
+    ("Por causa", resumo_causa),
+    ("Por região", resumo_regiao),
+    ("Sem preço na tabela", formatar(sem_preco)),
+    ("Não auditado", formatar(nao_auditado)),
+    ("Base completa", formatar(res)),
+]
+
+b1, b2, b3 = st.columns(3)
 with b1:
-    st.download_button(
-        "📊 Baixar Excel completo",
-        gerar_excel([
-            ("Divergências", formatar(divergencias.reindex(
-                divergencias["impacto_rs"].abs().sort_values(ascending=False).index))),
-            ("Resumo por cliente", resumo_cliente),
-            ("Resumo por causa", resumo_causa),
-            ("Resumo por região", resumo_regiao),
-            ("Sem preço na tabela", formatar(sem_preco)),
-            ("Não auditado", formatar(nao_auditado)),
-            ("Base completa", formatar(res)),
-        ]),
-        file_name=f"auditoria_precos_{date.today():%Y%m%d}.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        use_container_width=True, type="primary",
-    )
+    try:
+        st.download_button(
+            "📊 Baixar Excel completo", gerar_excel(abas_saida),
+            file_name=f"auditoria_precos_{date.today():%Y%m%d}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True, type="primary",
+        )
+    except Exception as erro:  # noqa: BLE001
+        st.warning(f"Excel indisponível neste ambiente ({erro}). "
+                   "Baixe os CSVs ao lado.")
+        st.download_button(
+            "🗂️ Baixar CSVs (ZIP)", gerar_csvs_zip(abas_saida),
+            file_name=f"auditoria_precos_{date.today():%Y%m%d}.zip",
+            mime="application/zip", use_container_width=True,
+        )
 with b2:
-    st.download_button("📝 Baixar texto do e-mail", texto_email.encode("utf-8"),
+    st.download_button("🖹 Baixar e-mail em HTML", html_email.encode("utf-8"),
+                       file_name=f"email_auditoria_{date.today():%Y%m%d}.html",
+                       mime="text/html", use_container_width=True)
+with b3:
+    st.download_button("📝 Baixar e-mail em texto", texto_email.encode("utf-8"),
                        file_name=f"email_auditoria_{date.today():%Y%m%d}.txt",
                        mime="text/plain", use_container_width=True)
