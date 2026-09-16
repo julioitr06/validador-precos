@@ -1,12 +1,11 @@
 import streamlit as st
 import pandas as pd
-import urllib.parse # Biblioteca para criar o link do e-mail
+import urllib.parse
 
 st.set_page_config(page_title="Auditoria de Preços", layout="wide", page_icon="🤖")
 st.title("🤖 Robô de Auditoria de Preços")
 st.write("Insira os arquivos abaixo para cruzar o faturamento com a tabela oficial.")
 
-# Área de Upload
 col1, col2 = st.columns(2)
 with col1:
     arquivo_fat = st.file_uploader("📥 CSV do Faturamento (Looker)", type=['csv'])
@@ -19,10 +18,29 @@ if arquivo_fat and arquivo_tab:
             df_fat = pd.read_csv(arquivo_fat)
             df_tab = pd.read_csv(arquivo_tab)
 
+            # --- NOVA FUNÇÃO DE LIMPEZA DE NÚMEROS ---
+            # Remove R$, espaços e ajusta vírgulas para que o Python entenda como matemática
+            def limpar_numero(val):
+                if pd.api.types.is_number(val):
+                    return val
+                val = str(val).strip().replace('R$', '').replace(' ', '')
+                if ',' in val:
+                    val = val.replace('.', '').replace(',', '.')
+                return pd.to_numeric(val, errors='coerce')
+
+            # Aplica a limpeza nas colunas de valor antes da divisão
+            df_fat['totalfinanceiro'] = df_fat['totalfinanceiro'].apply(limpar_numero)
+            df_fat['QTD caixa'] = df_fat['QTD caixa'].apply(limpar_numero)
+            
+            if 'Preço Final CX' in df_tab.columns:
+                df_tab['Preço Final CX'] = df_tab['Preço Final CX'].apply(limpar_numero)
+            # ----------------------------------------
+
             df_fat['emissaomovdate'] = pd.to_datetime(df_fat['emissaomovdate'], format='%d/%m/%Y', errors='coerce')
             df_tab['vigencia_inicio'] = pd.to_datetime(df_tab['vigencia_inicio'], errors='coerce')
             df_tab['vigencia_fim'] = pd.to_datetime(df_tab['vigencia_fim'], errors='coerce')
 
+            # Agora a divisão vai funcionar perfeitamente
             df_fat['Preco_Faturado_CX'] = df_fat['totalfinanceiro'] / df_fat['QTD caixa']
 
             df_cruzado = pd.merge(
@@ -43,7 +61,6 @@ if arquivo_fat and arquivo_tab:
 
             st.divider()
             
-            # --- EXIBIÇÃO DE RESULTADOS E E-MAIL ---
             if not divergencias.empty:
                 st.error(f"⚠️ Foram encontradas {len(divergencias)} divergências de preço!")
                 
@@ -52,7 +69,6 @@ if arquivo_fat and arquivo_tab:
                 
                 st.subheader("✉️ Notificar Responsáveis")
                 
-                # Monta o resumo dos itens para o corpo do e-mail
                 resumo_itens = ""
                 for index, row in divergencias.head(5).iterrows():
                     resumo_itens += f"• Cliente: {row['cliente.c']} | Variedade: {row['recurso.variedade.c']} | Faturado: R$ {row['Preco_Faturado_CX']} | Tabela: R$ {row['Preço Final CX']}\n"
@@ -60,7 +76,6 @@ if arquivo_fat and arquivo_tab:
                 if len(divergencias) > 5:
                     resumo_itens += f"\n... e mais {len(divergencias) - 5} item(ns). O detalhamento completo está no arquivo CSV em anexo.\n"
 
-                # Cria o modelo de texto
                 modelo_email = f"""Olá equipe Comercial / Faturamento,
 
 O Robô de Auditoria identificou {len(divergencias)} lançamento(s) faturado(s) com preço divergente da Tabela Oficial.
@@ -72,18 +87,13 @@ Por favor, verifiquem se houve alguma exceção ou desconto aprovado para estes 
 Atenciosamente,
 Auditoria de Preços"""
                 
-                # Mostra o texto na tela para o usuário ler/copiar
                 st.text_area("📋 Modelo de E-mail gerado (Revise ou copie se necessário):", value=modelo_email, height=280)
                 
-                # Codifica o texto para o formato de link de e-mail (mailto)
                 assunto = urllib.parse.quote("⚠️ Alerta: Divergência de Preços (Faturamento x Tabela)")
                 corpo = urllib.parse.quote(modelo_email)
-                
-                # Substitua os e-mails abaixo pelos da sua empresa
                 email_destino = "comercial@suaempresa.com.br;faturamento@suaempresa.com.br"
                 link_mailto = f"mailto:{email_destino}?subject={assunto}&body={corpo}"
                 
-                # Botões de Ação
                 col_btn1, col_btn2 = st.columns(2)
                 with col_btn1:
                     csv = divergencias.to_csv(index=False).encode('utf-8')
